@@ -1,17 +1,25 @@
-function fuzzy_line_follow_robot_single_file()
+function fuzzy_line_follow_robot_single_file(tuning)
 % FUZZY_LINE_FOLLOW_ROBOT_SINGLE_FILE
 % Single-file MATLAB implementation of a fuzzy-logic line-following robot.
 % Run this function directly.
 
-    robot = createRobotParams();
-    sim   = createSimulationParams();
+    if nargin < 1
+        tuning = struct();
+    end
+
+    if ~isstruct(tuning)
+        tuning = struct();
+    end
+
+    robot = createRobotParams(tuning);
+    sim   = createSimulationParams(tuning);
     fis   = createFuzzyController();
 
     result = runSimulation(robot, sim, fis);
-    plotResults(result, sim);
+    plotResults(result, sim, robot);
 end
 
-function robot = createRobotParams()
+function robot = createRobotParams(tuning)
     robot.v     = 0.25;   % Constant linear speed (m/s)
     robot.wMax  = 2.5;    % Max angular speed (rad/s)
     robot.eMax  = 0.50;   % Error normalization scale (m)
@@ -20,15 +28,30 @@ function robot = createRobotParams()
     robot.x0     = 0.0;
     robot.y0     = -0.4;
     robot.theta0 = 0.0;
+
+    robot.bodyLength = 0.22;   % Differential-drive body length (m)
+    robot.bodyWidth  = 0.14;    % Differential-drive body width (m)
+    robot.wheelLength = 0.09;   % Wheel visual length (m)
+    robot.wheelWidth  = 0.03;    % Wheel visual width (m)
+
+    robot = applyOverrides(robot, tuning, "robot");
 end
 
-function sim = createSimulationParams()
+function sim = createSimulationParams(tuning)
     sim.dt = 0.02;
     sim.T  = 24;
     sim.t  = 0:sim.dt:sim.T;
 
     % Reference line y = f(x)
     sim.lineFcn = @(x) 0.35*sin(0.8*x) + 0.05*cos(2.2*x);
+
+    sim = applyOverrides(sim, tuning, "sim");
+
+    if isfield(tuning, "lineFcn") && isa(tuning.lineFcn, "function_handle")
+        sim.lineFcn = tuning.lineFcn;
+    end
+
+    sim.t = 0:sim.dt:sim.T;
 end
 
 function fis = createFuzzyController()
@@ -107,9 +130,12 @@ function result = runSimulation(robot, sim, fis)
     result.de    = de;
     result.wCmd  = wCmd;
     result.yRef  = yRef;
+    result.metrics.rmsError = sqrt(mean(e.^2));
+    result.metrics.maxAbsError = max(abs(e));
+    result.metrics.finalError = e(end);
 end
 
-function plotResults(result, sim)
+function plotResults(result, sim, robot)
     xLine = linspace(min(result.x)-0.2, max(result.x)+0.2, 700);
     yLine = sim.lineFcn(xLine);
 
@@ -118,11 +144,25 @@ function plotResults(result, sim)
 
     nexttile;
     plot(xLine, yLine, "k--","LineWidth",1.6); hold on;
-    plot(result.x, result.y, "b","LineWidth",2.0);
+    plot(result.x, result.y, "b","LineWidth",1.6);
+    trailLine = animatedline("Color",[0 0.45 0.74],"LineWidth",2.0,"HandleVisibility","off");
+    [bodyPatch, leftWheelPatch, rightWheelPatch, headingLine] = createVehicleGraphics();
     axis equal; grid on;
     xlabel("x (m)"); ylabel("y (m)");
-    title("Robot Trajectory vs Reference Line");
+    title(sprintf("Robot Trajectory vs Reference Line | RMS e = %.3f m", result.metrics.rmsError));
     legend("Reference line","Robot path","Location","best");
+    xlim([min(xLine) max(xLine)]);
+    ylim([min(min(yLine), min(result.y)) - 0.2, max(max(yLine), max(result.y)) + 0.2]);
+
+    for k = 1:numel(result.x)
+        [bx, by, lwx, lwy, rwx, rwy, hx, hy] = vehicleGeometry(result.x(k), result.y(k), result.theta(k), robot);
+        set(bodyPatch, "XData", bx, "YData", by);
+        set(leftWheelPatch, "XData", lwx, "YData", lwy);
+        set(rightWheelPatch, "XData", rwx, "YData", rwy);
+        set(headingLine, "XData", hx, "YData", hy);
+        addpoints(trailLine, result.x(k), result.y(k));
+        drawnow limitrate;
+    end
 
     nexttile;
     plot(sim.t, result.e, "r","LineWidth",1.5); grid on;
@@ -133,6 +173,56 @@ function plotResults(result, sim)
     plot(sim.t, result.wCmd, "m","LineWidth",1.5); grid on;
     xlabel("Time (s)"); ylabel("\omega command (rad/s)");
     title("Fuzzy Controller Output");
+end
+
+function params = applyOverrides(params, tuning, groupName)
+    if isfield(tuning, groupName) && isstruct(tuning.(groupName))
+        overrideFields = fieldnames(tuning.(groupName));
+        for i = 1:numel(overrideFields)
+            fieldName = overrideFields{i};
+            params.(fieldName) = tuning.(groupName).(fieldName);
+        end
+    end
+end
+
+function [bodyX, bodyY, leftWheelX, leftWheelY, rightWheelX, rightWheelY, headingX, headingY] = vehicleGeometry(x, y, theta, robot)
+    bodyLocal = [
+         robot.bodyLength/2,  robot.bodyLength/2, -robot.bodyLength/2, -robot.bodyLength/2;
+         robot.bodyWidth/2,  -robot.bodyWidth/2,  -robot.bodyWidth/2,   robot.bodyWidth/2
+    ];
+
+    wheelY = robot.bodyWidth/2 + robot.wheelWidth/2;
+    wheelLocal = [
+         -robot.wheelLength/2,  robot.wheelLength/2;
+          wheelY,               wheelY
+    ];
+    wheelLocalMirror = wheelLocal;
+    wheelLocalMirror(2,:) = -wheelLocalMirror(2,:);
+
+    headingLocal = [0, robot.bodyLength/2; 0, 0];
+
+    transform = [cos(theta) -sin(theta); sin(theta) cos(theta)];
+
+    bodyPts = transform * bodyLocal + [x; y];
+    leftPts = transform * wheelLocal + [x; y];
+    rightPts = transform * wheelLocalMirror + [x; y];
+    headingPts = transform * headingLocal + [x; y];
+
+    bodyX = bodyPts(1,:);
+    bodyY = bodyPts(2,:);
+    leftWheelX = leftPts(1,:);
+    leftWheelY = leftPts(2,:);
+    rightWheelX = rightPts(1,:);
+    rightWheelY = rightPts(2,:);
+    headingX = headingPts(1,:);
+    headingY = headingPts(2,:);
+end
+
+function [bodyPatch, leftWheelPatch, rightWheelPatch, headingLine] = createVehicleGraphics()
+    bodyPatch = patch("XData",nan,"YData",nan,"FaceColor",[0.2 0.6 0.9],"FaceAlpha",0.35,"EdgeColor",[0.1 0.25 0.45],"LineWidth",1.5,"HandleVisibility","off");
+    leftWheelPatch = patch("XData",nan,"YData",nan,"FaceColor",[0.12 0.12 0.12],"EdgeColor",[0.05 0.05 0.05],"LineWidth",1.0,"HandleVisibility","off");
+    rightWheelPatch = patch("XData",nan,"YData",nan,"FaceColor",[0.12 0.12 0.12],"EdgeColor",[0.05 0.05 0.05],"LineWidth",1.0,"HandleVisibility","off");
+    headingLine = plot([nan nan], [nan nan], "Color",[0.85 0.33 0.1],"LineWidth",2.0,"HandleVisibility","off");
 end
 
 function y = clamp(x, lo, hi)
